@@ -24,6 +24,7 @@ use serenity::{
 
 use songbird::{
     driver::DecodeMode,
+    events::context_data::VoiceTick,
     model::{id::UserId, payload::Speaking},
     Config, CoreEvent, Event, EventContext, EventHandler as VoiceEventHandler,
 };
@@ -123,6 +124,29 @@ async fn fire_request(
     Ok(())
 }
 
+async fn fire_tick(tick: &VoiceTick, ctx: Receiver) {
+    for (ssrc, data) in &tick.speaking {
+        tracing::error!("got ssrc {ssrc}");
+        if let Some(decoded_voice) = data.decoded_voice.as_ref() {
+            if let Some(mut user) = ctx.users.get_mut(ssrc) {
+                user.0.extend_from_slice(decoded_voice);
+            } else {
+                tracing::error!("Decode disabled.");
+            }
+        }
+    }
+    for i in ctx.users.iter() {
+        let (ssrc, _user) = i.pair();
+        if !tick.speaking.contains_key(ssrc) {
+            if let Some((_ssrc, (voicedata, userid))) = ctx.users.remove(ssrc) {
+                let http = ctx.http.clone();
+                tracing::trace!("firing");
+                tokio::spawn(async move { fire_request(http, userid, voicedata).await });
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl VoiceEventHandler for Receiver {
     #[allow(unused_variables)]
@@ -139,31 +163,9 @@ impl VoiceEventHandler for Receiver {
                     .insert(*ssrc, (Vec::with_capacity(DEFAULT_SAMPLE_COUNT), *user_id));
             }
             Ctx::VoiceTick(tick) => {
-                for (ssrc, data) in &tick.speaking {
-                    tracing::error!("got ssrc {ssrc}");
-                    let Some(mut user) = self.users.get_mut(ssrc) else {
-                        continue;
-                    };
-                    if let Some(decoded_voice) = data.decoded_voice.as_ref() {
-                        let voice_len = decoded_voice.len();
-                        tracing::trace!("extending");
-                        user.0.extend_from_slice(decoded_voice);
-                    } else {
-                        tracing::error!("Decode disabled.");
-                    }
-                }
-                for i in self.users.iter() {
-                    let (ssrc, user) = i.pair();
-                    if !tick.speaking.contains_key(ssrc) {
-                        if let Some((ssrc, (voicedata, userid))) = self.users.remove(ssrc) {
-                            let http = self.http.clone();
-                            tracing::trace!("firing");
-                            tokio::spawn(
-                                async move { fire_request(http, userid, voicedata).await },
-                            );
-                        }
-                    }
-                }
+                tracing::trace!("got tick");
+                let rcvr = self.clone();
+                tokio::spawn(async move { fire_tick(tick, rcvr) });
             }
             _ => {
                 // We won't be registering this struct for any more event classes.
