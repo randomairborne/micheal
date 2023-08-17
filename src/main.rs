@@ -6,43 +6,60 @@
 //! git = "https://github.com/serenity-rs/serenity.git"
 //! features = ["client", "standard_framework", "voice"]
 //! ```
-use std::sync::Arc;
+use std::{
+    io::Cursor,
+    sync::{Arc, OnceLock},
+};
 
 use dashmap::DashMap;
 
 use serenity::{
+    all::GuildId,
     async_trait,
     client::{Client, Context, EventHandler},
-    framework::{
-        standard::{
-            macros::{command, group},
-            Args, CommandResult,
-        },
-        StandardFramework,
-    },
-    model::{channel::Message, gateway::Ready, id::ChannelId},
-    prelude::{GatewayIntents, Mentionable},
-    Result as SerenityResult,
+    framework::StandardFramework,
+    model::{gateway::Ready, id::ChannelId},
+    prelude::GatewayIntents,
 };
 
 use songbird::{
     driver::DecodeMode,
     model::{id::UserId, payload::Speaking},
-    Config, CoreEvent, Event, EventContext, EventHandler as VoiceEventHandler, SerenityInit,
+    Config, CoreEvent, Event, EventContext, EventHandler as VoiceEventHandler,
 };
 
 struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _: Context, ready: Ready) {
-        println!("{} is connected!", ready.user.name);
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        if let Ok(handler_lock) = songbird::get(&ctx)
+            .await
+            .unwrap()
+            .join(
+                CONFIG.get().unwrap().guild_id,
+                CONFIG.get().unwrap().channel_id,
+            )
+            .await
+        {
+            let mut handler = handler_lock.lock().await;
+
+            let evt_receiver = Receiver::new();
+
+            handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), evt_receiver.clone());
+            handler.add_global_event(CoreEvent::RtpPacket.into(), evt_receiver.clone());
+            handler.add_global_event(CoreEvent::RtcpPacket.into(), evt_receiver.clone());
+            handler.add_global_event(CoreEvent::ClientDisconnect.into(), evt_receiver.clone());
+            handler.add_global_event(CoreEvent::VoiceTick.into(), evt_receiver);
+        }
+        tracing::info!("{} is connected!", ready.user.name);
     }
 }
 
 #[derive(Clone)]
 struct Receiver {
     users: Arc<DashMap<u32, (Vec<i16>, UserId)>>,
+    http: reqwest::Client,
 }
 
 impl Receiver {
@@ -51,8 +68,59 @@ impl Receiver {
         // you can later store them in intervals.
         Self {
             users: Arc::new(DashMap::with_capacity(10)),
+            http: reqwest::Client::new(),
         }
     }
+}
+
+const DEFAULT_SAMPLE_COUNT: usize = 44_100 * 10 * 2;
+const AUDIO_SPEC: hound::WavSpec = hound::WavSpec {
+    channels: 2,
+    sample_rate: 44100,
+    bits_per_sample: 16,
+    sample_format: hound::SampleFormat::Int,
+};
+
+pub enum FireError {
+    Reqwest(reqwest::Error),
+    Hound(hound::Error),
+}
+
+impl From<hound::Error> for FireError {
+    fn from(value: hound::Error) -> Self {
+        Self::Hound(value)
+    }
+}
+
+impl From<reqwest::Error> for FireError {
+    fn from(value: reqwest::Error) -> Self {
+        Self::Reqwest(value)
+    }
+}
+
+async fn fire_request(
+    client: reqwest::Client,
+    id: UserId,
+    audio: Vec<i16>,
+) -> Result<(), FireError> {
+    let mut buf = Vec::with_capacity(audio.len() * 2);
+    let mut writer = hound::WavWriter::new(Cursor::new(&mut buf), AUDIO_SPEC)?;
+    for sample in audio {
+        writer.write_sample(sample)?;
+    }
+    writer.finalize()?;
+    client
+        .post(&CONFIG.get().unwrap().endpoint)
+        .header("User-Id", id.to_string())
+        .header(
+            "Authorization",
+            format!("Bearer {}", CONFIG.get().unwrap().endpoint_token),
+        )
+        .body(buf)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 #[async_trait]
@@ -68,24 +136,32 @@ impl VoiceEventHandler for Receiver {
                 ..
             }) => {
                 self.users
-                    .insert(*ssrc, (Vec::with_capacity(1_000_000), *user_id));
+                    .insert(*ssrc, (Vec::with_capacity(DEFAULT_SAMPLE_COUNT), *user_id));
             }
             Ctx::VoiceTick(tick) => {
                 for (ssrc, data) in &tick.speaking {
+                    tracing::error!("got ssrc {ssrc}");
                     let Some(mut user) = self.users.get_mut(ssrc) else {
                         continue;
                     };
                     if let Some(decoded_voice) = data.decoded_voice.as_ref() {
                         let voice_len = decoded_voice.len();
+                        tracing::trace!("extending");
                         user.0.extend_from_slice(decoded_voice);
                     } else {
-                        println!("ERROR: Decode disabled.");
+                        tracing::error!("Decode disabled.");
                     }
                 }
                 for i in self.users.iter() {
                     let (ssrc, user) = i.pair();
                     if !tick.speaking.contains_key(ssrc) {
-                        tokio::spawn(async { fire_request().await });
+                        if let Some((ssrc, (voicedata, userid))) = self.users.remove(ssrc) {
+                            let http = self.http.clone();
+                            tracing::trace!("firing");
+                            tokio::spawn(
+                                async move { fire_request(http, userid, voicedata).await },
+                            );
+                        }
                     }
                 }
             }
@@ -98,126 +174,39 @@ impl VoiceEventHandler for Receiver {
     }
 }
 
-#[group]
-#[commands(join, leave)]
-struct General;
+static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
     let config: AppConfig = envy::from_env().expect("Failed to read config");
+    let framework = StandardFramework::new();
 
-    let framework = StandardFramework::new().group(&GENERAL_GROUP);
-    framework.configure(|c| c.prefix("~"));
-
-    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
-
-    // Here, we need to configure Songbird to decode all incoming voice packets.
-    // If you want, you can do this on a per-call basis---here, we need it to
-    // read the audio data that other people are sending us!
+    let intents = GatewayIntents::GUILD_VOICE_STATES;
     let songbird_config = Config::default().decode_mode(DecodeMode::Decode);
-
-    let mut client = Client::builder(&config.discord_token, intents)
+    let chickadee = songbird::Songbird::serenity();
+    chickadee.set_config(songbird_config);
+    let mut client_builder = Client::builder(&config.discord_token, intents);
+    client_builder = songbird::serenity::register_with(client_builder, chickadee.clone());
+    let mut client = client_builder
         .event_handler(Handler)
         .framework(framework)
-        .register_songbird_from_config(songbird_config)
         .await
         .expect("Err creating client");
-
+    CONFIG.set(config).unwrap();
     let _ = client
         .start()
         .await
-        .map_err(|why| println!("Client ended: {:?}", why));
+        .map_err(|why| tracing::info!("Client ended: {:?}", why));
 }
 
-#[command]
-#[only_in(guilds)]
-async fn join(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
-    let connect_to = match args.single::<std::num::NonZeroU64>() {
-        Ok(id) => ChannelId(id),
-        Err(_) => {
-            check_msg(
-                msg.reply(ctx, "Requires a valid voice channel ID be given")
-                    .await,
-            );
-
-            return Ok(());
-        }
-    };
-
-    let guild_id = msg.guild_id.unwrap();
-
-    let manager = songbird::get(ctx)
-        .await
-        .expect("Songbird Voice client placed in at initialisation.")
-        .clone();
-
-    if let Ok(handler_lock) = manager.join(guild_id, connect_to).await {
-        let mut handler = handler_lock.lock().await;
-
-        let evt_receiver = Receiver::new();
-
-        handler.add_global_event(CoreEvent::SpeakingStateUpdate.into(), evt_receiver.clone());
-        handler.add_global_event(CoreEvent::RtpPacket.into(), evt_receiver.clone());
-        handler.add_global_event(CoreEvent::RtcpPacket.into(), evt_receiver.clone());
-        handler.add_global_event(CoreEvent::ClientDisconnect.into(), evt_receiver.clone());
-        handler.add_global_event(CoreEvent::VoiceTick.into(), evt_receiver);
-
-        check_msg(
-            msg.channel_id
-                .say(&ctx.http, &format!("Joined {}", connect_to.mention()))
-                .await,
-        );
-    } else {
-        check_msg(
-            msg.channel_id
-                .say(&ctx.http, "Error joining the channel")
-                .await,
-        );
-    }
-
-    Ok(())
-}
-
-#[command]
-#[only_in(guilds)]
-async fn leave(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild_id = msg.guild_id.unwrap();
-
-    let manager = songbird::get(ctx)
-        .await
-        .expect("Songbird Voice client placed in at initialisation.")
-        .clone();
-    let has_handler = manager.get(guild_id).is_some();
-
-    if has_handler {
-        if let Err(e) = manager.remove(guild_id).await {
-            check_msg(
-                msg.channel_id
-                    .say(&ctx.http, format!("Failed: {:?}", e))
-                    .await,
-            );
-        }
-
-        check_msg(msg.channel_id.say(&ctx.http, "Left voice channel").await);
-    } else {
-        check_msg(msg.reply(ctx, "Not in a voice channel").await);
-    }
-
-    Ok(())
-}
-
-/// Checks that a message successfully sent; if not, then logs why to stdout.
-fn check_msg(result: SerenityResult<Message>) {
-    if let Err(why) = result {
-        println!("Error sending message: {:?}", why);
-    }
-}
-
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Debug)]
 pub struct AppConfig {
     discord_token: String,
     endpoint_token: String,
     endpoint: String,
+    guild_id: GuildId,
+    channel_id: ChannelId,
 }
