@@ -8,6 +8,7 @@
 //! ```
 use std::{
     io::Cursor,
+    num::NonZeroUsize,
     sync::{Arc, OnceLock},
 };
 
@@ -82,6 +83,7 @@ const AUDIO_SPEC: hound::WavSpec = hound::WavSpec {
     sample_format: hound::SampleFormat::Int,
 };
 
+#[derive(Debug)]
 pub enum FireError {
     Reqwest(reqwest::Error),
     Hound(hound::Error),
@@ -110,13 +112,14 @@ async fn fire_request(
         writer.write_sample(sample)?;
     }
     writer.finalize()?;
+    // tokio::fs::write("./out.wav", &buf).await.unwrap();
     client
-        .post(&CONFIG.get().unwrap().endpoint)
+        .put(&CONFIG.get().unwrap().endpoint)
         .header("User-Id", id.to_string())
         .header(
             "Authorization",
             format!("Bearer {}", CONFIG.get().unwrap().endpoint_token),
-        )
+        ).header("Content-Type", "audio/wav")
         .body(buf)
         .send()
         .await?
@@ -124,25 +127,32 @@ async fn fire_request(
     Ok(())
 }
 
-async fn fire_tick(tick: &VoiceTick, ctx: Receiver) {
+async fn fire_tick(tick: VoiceTick, ctx: Receiver) {
     for (ssrc, data) in &tick.speaking {
-        tracing::error!("got ssrc {ssrc}");
+        tracing::trace!("got ssrc {ssrc}");
         if let Some(decoded_voice) = data.decoded_voice.as_ref() {
             if let Some(mut user) = ctx.users.get_mut(ssrc) {
                 user.0.extend_from_slice(decoded_voice);
-            } else {
-                tracing::error!("Decode disabled.");
             }
+        } else {
+            tracing::error!("Decode disabled.");
         }
     }
+    let mut deletions: Vec<u32> = Vec::with_capacity(10);
     for i in ctx.users.iter() {
-        let (ssrc, _user) = i.pair();
-        if !tick.speaking.contains_key(ssrc) {
-            if let Some((_ssrc, (voicedata, userid))) = ctx.users.remove(ssrc) {
-                let http = ctx.http.clone();
-                tracing::trace!("firing");
-                tokio::spawn(async move { fire_request(http, userid, voicedata).await });
-            }
+        let (ssrc, user) = i.pair();
+        if tick.silent.contains(ssrc) && !user.0.is_empty() {
+            deletions.push(*ssrc);
+        }
+    }
+    for ssrc in deletions {
+        if let Some((_ssrc, (voicedata, userid))) = ctx.users.remove(&ssrc) {
+            let http = ctx.http.clone();
+            tokio::spawn(async move {
+                if let Err(source) = fire_request(http, userid, voicedata).await {
+                    tracing::error!(?source);
+                }
+            });
         }
     }
 }
@@ -163,9 +173,9 @@ impl VoiceEventHandler for Receiver {
                     .insert(*ssrc, (Vec::with_capacity(DEFAULT_SAMPLE_COUNT), *user_id));
             }
             Ctx::VoiceTick(tick) => {
-                tracing::trace!("got tick");
                 let rcvr = self.clone();
-                tokio::spawn(async move { fire_tick(tick, rcvr) });
+                let tick = tick.to_owned();
+                tokio::spawn(fire_tick(tick, rcvr));
             }
             _ => {
                 // We won't be registering this struct for any more event classes.
@@ -187,7 +197,9 @@ async fn main() {
     let framework = StandardFramework::new();
 
     let intents = GatewayIntents::GUILD_VOICE_STATES;
-    let songbird_config = Config::default().decode_mode(DecodeMode::Decode);
+    let songbird_config = Config::default()
+        .decode_mode(DecodeMode::Decode)
+        .playout_buffer_length(NonZeroUsize::new(20).unwrap());
     let chickadee = songbird::Songbird::serenity();
     chickadee.set_config(songbird_config);
     let mut client_builder = Client::builder(&config.discord_token, intents);
