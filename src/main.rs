@@ -119,7 +119,8 @@ async fn fire_request(
         .header(
             "Authorization",
             format!("Bearer {}", CONFIG.get().unwrap().endpoint_token),
-        ).header("Content-Type", "audio/wav")
+        )
+        .header("Content-Type", "audio/wav")
         .body(buf)
         .send()
         .await?
