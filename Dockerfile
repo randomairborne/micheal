@@ -1,10 +1,15 @@
-FROM alpine
-ARG TARGETARCH
+FROM rust:alpine AS builder
 
-COPY /${TARGETARCH}-executables/micheal /usr/bin/
-COPY /templates/ /etc/micheal/templates/
+WORKDIR "/build"
+
+COPY . .
 
 RUN apk add opus
+RUN cargo build --release
 
-WORKDIR "/etc/micheal/"
+FROM alpine
+
+RUN apk add opus
+COPY --from=builder /build/target/release/micheal /usr/bin/micheal
+
 ENTRYPOINT "/usr/bin/micheal"
