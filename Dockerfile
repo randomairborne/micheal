@@ -4,7 +4,7 @@ WORKDIR "/build"
 
 COPY . .
 
-RUN apk add opus musl-dev
+RUN apk add opus musl-dev cmake
 RUN cargo build --release
 
 FROM alpine
