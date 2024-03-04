@@ -15,7 +15,7 @@ dotenvy = "0.15.7"
 dashmap = "5"
 
 [dependencies.serenity]
-features = ["client", "standard_framework", "voice", "rustls_backend"]
+features = ["client", "voice", "rustls_backend"]
 git = "https://github.com/serenity-rs/serenity"
 branch = "next"
 
